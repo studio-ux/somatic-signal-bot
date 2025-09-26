@@ -1,211 +1,187 @@
-// somatic-signal concierge - secure backend
+// api/server.js
 import express from "express";
 import cors from "cors";
+import fetch from "node-fetch";
 
 const app = express();
-app.use(cors());              // MVP: allow all (you can restrict to your domain later)
+app.use(cors());
 app.use(express.json());
 
-/* ===== ENV ===== */
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
-const OPENAI_MODEL   = process.env.OPENAI_MODEL || "gpt-4.1-mini";
-const SYSTEM_PROMPT  = process.env.SYSTEM_PROMPT || buildSystemPrompt();
+// === ENVIRONMENT VARS (from Vercel dashboard) ===
+const OPENAI_API_KEY   = process.env.OPENAI_API_KEY;
+const OPENAI_MODEL     = process.env.OPENAI_MODEL || "gpt-4.1-mini";
+const SYSTEM_PROMPT    = process.env.SYSTEM_PROMPT || "You are the Somatic Signal Concierge.";
+const FLODESK_API_KEY  = process.env.FLODESK_API_KEY;
+const FLODESK_SEGMENT_ID = process.env.FLODESK_SEGMENT_ID;
 
-const FLODESK_API_KEY     = process.env.FLODESK_API_KEY || "";     // NEVER put this in the browser
-const FLODESK_SEGMENT_ID  = process.env.FLODESK_SEGMENT_ID || "";  // e.g. "seg_xxx"
+// === HEALTH CHECK ===
+app.get("/health", (req, res) => res.json({ ok: true, time: new Date().toISOString() }));
 
-/* ===== Health ===== */
-app.get("/health", (_req, res) => res.json({
-  ok: true,
-  haveOpenAI: !!OPENAI_API_KEY,
-  haveFlodesk: !!FLODESK_API_KEY && !!FLODESK_SEGMENT_ID,
-  model: OPENAI_MODEL
-}));
-
-/* ===== Friendly Index ===== */
-app.get("/", (_req, res) => {
-  res.type("text").send(
-`Somatic Signal Concierge API
-GET  /health
-POST /chat           -> { userMessage, pageContext? } -> { ok, text }
-POST /lead           -> { name, email, tags?, page_url? } -> { ok }
-`
-  );
-});
-
-/* ===== CHAT (Non-streaming, robust) ===== */
+// === CHAT ROUTE ===
 app.post("/chat", async (req, res) => {
   try {
     const { userMessage = "", pageContext = "" } = req.body || {};
-    const messages = [
+    if (!userMessage) return res.status(400).json({ error: "missing_message" });
+
+    const prompt = [
       { role: "system", content: SYSTEM_PROMPT },
-      { role: "user", content: composeUserContent(userMessage, pageContext) }
+      { role: "user", content: `Page: ${pageContext}\nMessage: ${userMessage}` }
     ];
 
-    // if no key, return high-quality local answer (keeps UX alive)
-    if (!OPENAI_API_KEY) {
-      const text = localAnswer(userMessage);
-      return res.json({ ok: true, text });
-    }
-
-    const r = await fetch("https://api.openai.com/v1/responses", {
+    const r = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
         "Authorization": `Bearer ${OPENAI_API_KEY}`,
         "Content-Type": "application/json"
       },
-      body: JSON.stringify({ model: OPENAI_MODEL, input: messages })
+      body: JSON.stringify({
+        model: OPENAI_MODEL,
+        messages: prompt,
+        temperature: 0.6,
+        max_tokens: 500
+      })
     });
 
-    const data = await r.json().catch(() => ({}));
+    const data = await r.json();
     if (!r.ok) {
-      console.error("OpenAI error:", r.status, data);
-      const text = localAnswer(userMessage);
-      return res.json({ ok: true, text });
+      console.error("OpenAI error:", data);
+      return res.status(500).json({ error: "openai_error", data });
     }
 
-    const text = extractText(data) || localAnswer(userMessage);
+    const text = data.choices?.[0]?.message?.content?.trim() || "…";
     res.json({ ok: true, text });
   } catch (e) {
-    console.error("Chat failed:", e);
-    res.json({ ok: true, text: localAnswer(req.body?.userMessage || "") });
+    console.error("CHAT exception:", e);
+    res.status(500).json({ error: "server_error" });
   }
 });
 
-/* ===== LEAD -> Flodesk (secure) ===== */
+// === LEAD CAPTURE ROUTE (Flodesk with Bearer→Basic fallback) ===
 app.post("/lead", async (req, res) => {
-  try {
-    const { name = "", email = "", tags = [], page_url = "" } = req.body || {};
-    if (!email) return res.status(400).json({ ok: false, error: "email_required" });
+  const { name = "", email = "", tags = [], page_url = "" } = req.body || {};
+  if (!email) return res.status(400).json({ ok: false, error: "email_required" });
 
-    // Always log internally for backup
-    console.log("LEAD", { name, email, tags, page_url, ts: new Date().toISOString() });
+  const haveCreds = !!FLODESK_API_KEY && !!FLODESK_SEGMENT_ID;
+  const result = { ok: false, stored: "none", haveCreds, email, segment: FLODESK_SEGMENT_ID };
 
-    // If Flodesk creds missing, still return ok so UX is smooth
-    if (!FLODESK_API_KEY || !FLODESK_SEGMENT_ID) {
-      return res.json({ ok: true, stored: "logs_only" });
-    }
+  console.log("LEAD", { name, email, tags, page_url, ts: new Date().toISOString() });
 
-    // Flodesk API note:
-    // Do not expose the API key client-side. Calls must come from this server.
-    // Official Flodesk docs show creating/upserting subscriber then attaching to segment.
-    // Endpoints (typical pattern) — adjust if your account uses updated routes:
-    // 1) POST /v1/subscribers
-    // 2) POST /v1/segments/{segmentId}/subscribers
-    // Authorization header varies by account (Bearer or Basic). Many accounts now use:
-    //   Authorization: Bearer {FLODESK_API_KEY}
-    // If your workspace uses Basic, change the header below accordingly.
+  if (!haveCreds) {
+    result.ok = true;
+    result.stored = "logs_only";
+    return res.json(result);
+  }
 
-    // Create/Update subscriber
-    const subRes = await fetch("https://api.flodesk.com/v1/subscribers", {
+  // === Helpers ===
+  const b64 = (s) => Buffer.from(s, "utf8").toString("base64");
+  const headersBearer = () => ({
+    "Authorization": `Bearer ${FLODESK_API_KEY}`,
+    "Content-Type": "application/json"
+  });
+  const headersBasic = () => ({
+    "Authorization": `Basic ${b64(`${FLODESK_API_KEY}:`)}`,
+    "Content-Type": "application/json"
+  });
+
+  async function flodeskFetch(url, options, useBasic = false) {
+    const headers = useBasic ? headersBasic() : headersBearer();
+    const r = await fetch(url, { ...options, headers });
+    const text = await r.text();
+    let json;
+    try { json = text ? JSON.parse(text) : {}; } catch { json = { raw: text }; }
+    return { r, json };
+  }
+
+  async function createOrGetSubscriber(useBasic = false) {
+    // 1. Try create
+    const create = await flodeskFetch("https://api.flodesk.com/v1/subscribers", {
       method: "POST",
-      headers: {
-        "Authorization": `Bearer ${FLODESK_API_KEY}`,
-        "Content-Type": "application/json"
-      },
       body: JSON.stringify({
         email,
         first_name: name || undefined,
         status: "active"
       })
-    });
+    }, useBasic);
 
-    const subData = await subRes.json().catch(() => ({}));
-    if (!subRes.ok) {
-      console.error("Flodesk subscriber error:", subRes.status, subData);
-      // Still reply ok so form UX doesn’t break; you’ll see the error in logs
-      return res.json({ ok: true, stored: "logs_only", flodesk_error: true });
+    if (create.r.ok && (create.json?.id || create.json?.data?.id)) {
+      return { id: create.json.id || create.json.data.id, created: true };
     }
 
-    const subscriberId = subData?.id;
-    // Attach to segment if we got an id
-    if (subscriberId) {
-      const segRes = await fetch(`https://api.flodesk.com/v1/segments/${FLODESK_SEGMENT_ID}/subscribers`, {
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${FLODESK_API_KEY}`,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({ subscriber_id: subscriberId })
-      });
-      if (!segRes.ok) {
-        const segData = await segRes.json().catch(() => ({}));
-        console.error("Flodesk segment attach error:", segRes.status, segData);
+    // 2. If already exists → try lookup
+    if ([400, 404, 409, 422].includes(create.r.status)) {
+      const find = await flodeskFetch(
+        `https://api.flodesk.com/v1/subscribers?email=${encodeURIComponent(email)}`,
+        { method: "GET" },
+        useBasic
+      );
+      if (find.r.ok) {
+        const item = (Array.isArray(find.json?.data) ? find.json.data[0] :
+                      Array.isArray(find.json) ? find.json[0] : null);
+        if (item?.id) return { id: item.id, created: false };
       }
+      return { id: null, created: false, noLookup: true };
     }
 
-    res.json({ ok: true, subscriberId: subscriberId || null });
-  } catch (e) {
-    console.error("Lead failed:", e);
-    res.json({ ok: true, stored: "logs_only" });
+    return { error: true, status: create.r.status, data: create.json };
   }
+
+  async function attachToSegment(subscriberId, useBasic = false) {
+    // Try subscriber_id first
+    if (subscriberId) {
+      const attach = await flodeskFetch(
+        `https://api.flodesk.com/v1/segments/${FLODESK_SEGMENT_ID}/subscribers`,
+        { method: "POST", body: JSON.stringify({ subscriber_id: subscriberId }) },
+        useBasic
+      );
+      if (attach.r.ok) return { ok: true, via: "id" };
+    }
+
+    // Fallback: by email
+    const attachByEmail = await flodeskFetch(
+      `https://api.flodesk.com/v1/segments/${FLODESK_SEGMENT_ID}/subscribers`,
+      { method: "POST", body: JSON.stringify({ email }) },
+      useBasic
+    );
+    if (attachByEmail.r.ok) return { ok: true, via: "email" };
+
+    return { ok: false, status: attachByEmail.r.status, data: attachByEmail.json };
+  }
+
+  // === Attempt with Bearer first ===
+  let sub = await createOrGetSubscriber(false);
+  let via = "bearer";
+
+  const authFail = (x) => x?.error && (x.status === 401 || x.status === 403);
+  if (sub?.error && authFail(sub)) {
+    sub = await createOrGetSubscriber(true);
+    via = "basic";
+  }
+
+  if (sub?.error) {
+    console.error("Flodesk subscriber fail:", via, sub.status, sub.data);
+    result.ok = true;
+    result.stored = "logs_only";
+    result.flodesk_error = { stage: "subscriber", auth: via, status: sub.status };
+    return res.json(result);
+  }
+
+  const attach = await attachToSegment(sub.id, via === "basic");
+  if (!attach.ok) {
+    console.error("Flodesk attach fail:", via, attach.status, attach.data);
+    result.ok = true;
+    result.stored = "logs_only";
+    result.flodesk_error = { stage: "segment", auth: via, status: attach.status };
+    return res.json(result);
+  }
+
+  result.ok = true;
+  result.stored = "flodesk";
+  result.subscriberId = sub.id || null;
+  result.auth = via;
+  result.attach_via = attach.via;
+  return res.json(result);
 });
 
-/* ===== Helpers ===== */
-function composeUserContent(userMessage, pageContext) {
-  const trimmed = (userMessage || "").trim();
-  const pc = pageContext ? `\n\n[Page]\n${pageContext}` : "";
-  return trimmed + pc;
-}
-
-function extractText(respJson){
-  if (!respJson) return "";
-  if (typeof respJson.output_text === "string" && respJson.output_text.trim()) return respJson.output_text;
-  if (Array.isArray(respJson.output)) {
-    for (const o of respJson.output) {
-      if (Array.isArray(o?.content)) {
-        for (const c of o.content) {
-          const t = c?.text?.value || c?.text || c?.value;
-          if (typeof t === "string" && t.trim()) return t;
-        }
-      }
-      const t2 = o?.text || o?.output_text;
-      if (typeof t2 === "string" && t2.trim()) return t2;
-    }
-  }
-  return "";
-}
-
-function localAnswer(q) {
-  // Fast on-brand fallback (guardrailed)
-  const s = (q || "").toLowerCase();
-  if (/commission/.test(s)) {
-    return "Commissions begin with a short consult to map story, space, and mood. Typical timelines run 6–10 weeks depending on scale. Share your name + best email and I’ll follow up with times.";
-  }
-  if (/scent|box/.test(s)) {
-    return "Collector Boxes pair a pigment print with a numbered scent accord and a short sonic layer. They’re staged to shift with time and attention. Want pricing + availability?";
-  }
-  if (/price|cost/.test(s)) {
-    return "I can share ranges and next steps. Exact quotes depend on scale, materials, and installation. If you share your email, I’ll send a short options sheet.";
-  }
-  if (/ar\b|augmented/.test(s)) {
-    return "Select works include an AR layer—subtle motion + sound designed to sit quietly in space. It’s optional for commissions. Happy to share examples on a call.";
-  }
-  return "Happy to help. Ask about Commissions, Collector Boxes, timelines, or the AR layer. If you’d like me to follow up, share your name + best email.";
-}
-
-function buildSystemPrompt() {
-  return `
-You are the Somatic Signal™ concierge for jeremymorton.art.
-Tone: warm, precise, art-forward, concise (<= 170 words unless asked).
-Primary goals:
-1) Explain Somatic Signal™ (painting + scent + sound + optional AR) in clear language.
-2) Guide visitors to: (a) Studio Commissions, (b) Collector Boxes, (c) Patron paths.
-3) If user shows buying intent, ask for name + best email, then call POST /lead with {name,email,page_url}.
-
-Guardrails:
-- Do NOT make medical/therapeutic claims.
-- If pricing requested and not explicit on site, give ranges only and invite a short call.
-- Be transparent when uncertain; prefer linking to About/Contact.
-- Never ask for sensitive data. Email + first name only.
-- Refuse political/explicit/unsafe topics; keep focus on the work.
-
-House style:
-- One short paragraph + an offer (tour, options, quick call).
-- Use compact headings only if asked for deep dives.
-- If user asks 'who are you / Jeremy?', give a crisp bio line and point to About.
-`;
-}
-
-export default app;
-
+// === START (Vercel provides PORT) ===
+const port = process.env.PORT || 3000;
+app.listen(port, () => console.log(`Somatic Signal Concierge API running on ${port}`));
