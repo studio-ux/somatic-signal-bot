@@ -1,6 +1,0 @@
-cd your-folder
-git init
-git remote add origin https://github.com/studio-ux/somatic-signal-bot.git
-git add .
-git commit -m "concierge MVP"
-git push -u origin main
