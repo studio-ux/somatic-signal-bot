@@ -2,15 +2,26 @@ import express from "express";
 import cors from "cors";
 
 const app = express();
-app.use(cors());          // after testing, lock to your domains
+
+/** ---------------- CORS (allow your domains) ---------------- **/
+app.use(cors({
+  origin: [
+    "https://jeremymorton.art",
+    "https://www.jeremymorton.art",
+    "https://jeremymorton.webflow.io"
+  ],
+  methods: ["GET","POST","OPTIONS"],
+  allowedHeaders: ["Content-Type","x-session-id"]
+}));
+
 app.use(express.json());
 
-// ENV
+/** ---------------- ENV ---------------- **/
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const OPENAI_MODEL   = process.env.OPENAI_MODEL || "gpt-4.1-mini";
 const SYSTEM_PROMPT  = process.env.SYSTEM_PROMPT || "You are a helpful concierge.";
 
-// in-memory sessions
+/** ---------------- In-memory session (ok for MVP) ---------------- **/
 const sessions = new Map(); // sessionId -> [{role, content}]
 function getSession(req) {
   let sid = req.headers["x-session-id"];
@@ -19,7 +30,19 @@ function getSession(req) {
   return { id: sid, messages: sessions.get(sid) };
 }
 
-// lead capture (log-only MVP)
+/** ---------------- Health & Friendly Root ---------------- **/
+app.get("/health", (_req, res) => res.json({ ok: true }));
+app.get("/", (_req, res) => {
+  res.type("text").send(
+`Somatic Signal Concierge API is running.
+Health: /health
+Chat (POST SSE): /chat/stream
+Chat (POST JSON): /chat
+Lead capture (POST): /leads/create`
+  );
+});
+
+/** ---------------- Lead capture (logs-only MVP) ---------------- **/
 app.post("/leads/create", async (req, res) => {
   try {
     const { name = "", email = "", tags = [], page_url = "" } = req.body || {};
@@ -32,7 +55,39 @@ app.post("/leads/create", async (req, res) => {
   }
 });
 
-// chat streaming via OpenAI Responses API
+/** ---------------- Non-streaming JSON endpoint (reliable fallback) ---------------- **/
+app.post("/chat", async (req, res) => {
+  try {
+    const { userMessage = "", pageContext = "" } = req.body || {};
+    const input = [
+      { role: "system", content: SYSTEM_PROMPT },
+      { role: "user", content: userMessage + (pageContext ? `\n\n[PageContext]\n${pageContext}` : "") }
+    ];
+
+    const r = await fetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${OPENAI_API_KEY}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ model: OPENAI_MODEL, input })
+    });
+
+    const data = await r.json();
+    if (!r.ok) {
+      console.error("OpenAI /chat error:", data);
+      return res.status(500).json({ error: "openai_failed", detail: data });
+    }
+
+    const text = data.output_text || ""; // Responses API returns joined text here
+    res.json({ text });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "failed" });
+  }
+});
+
+/** ---------------- Streaming SSE endpoint (nice UI typing) ---------------- **/
 app.post("/chat/stream", async (req, res) => {
   try {
     const { id, messages } = getSession(req);
@@ -45,6 +100,7 @@ app.post("/chat/stream", async (req, res) => {
       });
     }
 
+    // SSE headers
     res.writeHead(200, {
       "Content-Type": "text/event-stream",
       "Cache-Control": "no-cache, no-transform",
@@ -66,7 +122,7 @@ app.post("/chat/stream", async (req, res) => {
     });
 
     if (!r.ok || !r.body) {
-      const err = await r.text();
+      const err = await r.text().catch(() => "unknown");
       res.write(`event: error\ndata: ${JSON.stringify({ error: err })}\n\n`);
       return res.end();
     }
@@ -79,18 +135,26 @@ app.post("/chat/stream", async (req, res) => {
       const { value, done } = await reader.read();
       if (done) break;
       const chunk = decoder.decode(value, { stream: true });
-      for (const line of chunk.split("\n")) {
-        if (!line.startsWith("data:")) continue;
+
+      // The stream arrives as blocks "data: {...}\n\n"
+      for (const block of chunk.split("\n\n")) {
+        const line = block.trim();
+        if (!line || !line.startsWith("data:")) continue;
         const payload = line.slice(5).trim();
         if (!payload || payload === "[DONE]") continue;
+
         try {
-          const json = JSON.parse(payload);
-          const delta = json.output_text || json.delta || "";
+          const evt = JSON.parse(payload);
+
+          // Try all plausible text fields emitted by the Responses stream
+          const delta = evt.delta || evt.output_text || evt.text || "";
           if (delta) {
             assistantText += delta;
             res.write(`event: token\ndata: ${JSON.stringify({ token: delta })}\n\n`);
           }
-        } catch {/* keepalive */}
+        } catch {
+          // keepalive / non-JSON — ignore
+        }
       }
     }
 
@@ -107,39 +171,4 @@ app.post("/chat/stream", async (req, res) => {
   }
 });
 
-app.get("/health", (_req, res) => res.json({ ok: true }));
-app.post("/chat", async (req, res) => {
-  try {
-    const { userMessage = "", pageContext = "" } = req.body || {};
-    const input = [
-      { role: "system", content: SYSTEM_PROMPT },
-      { role: "user", content: userMessage + (pageContext ? `\n\n[PageContext]\n${pageContext}` : "") }
-    ];
-
-    const r = await fetch("https://api.openai.com/v1/responses", {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${OPENAI_API_KEY}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        model: OPENAI_MODEL,
-        input
-      })
-    });
-
-    const data = await r.json();
-    if (!r.ok) {
-      console.error("OpenAI error:", data);
-      return res.status(500).json({ error: "openai_failed", detail: data });
-    }
-
-    // The Responses API returns text in output_text (joined)
-    const text = data.output_text || "";
-    res.json({ text });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: "failed" });
-  }
-});
 export default app;
