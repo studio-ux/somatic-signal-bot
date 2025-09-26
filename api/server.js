@@ -108,4 +108,38 @@ app.post("/chat/stream", async (req, res) => {
 });
 
 app.get("/health", (_req, res) => res.json({ ok: true }));
+app.post("/chat", async (req, res) => {
+  try {
+    const { userMessage = "", pageContext = "" } = req.body || {};
+    const input = [
+      { role: "system", content: SYSTEM_PROMPT },
+      { role: "user", content: userMessage + (pageContext ? `\n\n[PageContext]\n${pageContext}` : "") }
+    ];
+
+    const r = await fetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${OPENAI_API_KEY}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        model: OPENAI_MODEL,
+        input
+      })
+    });
+
+    const data = await r.json();
+    if (!r.ok) {
+      console.error("OpenAI error:", data);
+      return res.status(500).json({ error: "openai_failed", detail: data });
+    }
+
+    // The Responses API returns text in output_text (joined)
+    const text = data.output_text || "";
+    res.json({ text });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "failed" });
+  }
+});
 export default app;
